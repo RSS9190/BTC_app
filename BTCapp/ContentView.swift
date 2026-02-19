@@ -50,47 +50,6 @@ struct DcaEntry: Codable, Identifiable, Hashable {
 
 // MARK: - DCA Export/Import Documents
 
-struct DcaJSONDocument: FileDocument {
-    static var readableContentTypes: [UTType] { [.json] }
-    static var writableContentTypes: [UTType] { [.json] }
-
-    var entries: [DcaEntry]
-
-    init(entries: [DcaEntry]) {
-        self.entries = entries
-    }
-
-    init(configuration: ReadConfiguration) throws {
-        let data = configuration.file.regularFileContents ?? Data()
-        self.entries = (try? JSONDecoder().decode([DcaEntry].self, from: data)) ?? []
-    }
-
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
-        let data = try JSONEncoder().encode(entries)
-        return .init(regularFileWithContents: data)
-    }
-}
-
-struct DcaCSVDocument: FileDocument {
-    static var readableContentTypes: [UTType] { [.commaSeparatedText, .plainText] }
-    static var writableContentTypes: [UTType] { [.commaSeparatedText] }
-
-    var csvText: String
-
-    init(csvText: String) {
-        self.csvText = csvText
-    }
-
-    init(configuration: ReadConfiguration) throws {
-        let data = configuration.file.regularFileContents ?? Data()
-        self.csvText = String(data: data, encoding: .utf8) ?? ""
-    }
-
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
-        FileWrapper(regularFileWithContents: Data(csvText.utf8))
-    }
-}
-
 struct DcaExportDocument: FileDocument {
     static var readableContentTypes: [UTType] { [.json, .commaSeparatedText, .plainText] }
     static var writableContentTypes: [UTType] { [.json, .commaSeparatedText] }
@@ -122,6 +81,7 @@ final class AppModel: ObservableObject {
         static let dcaKeychainKey = "dca_entries_json_device_only"
         static let satsMode = "sats_mode"
         static let satsGoalSats = "sats_goal_sats"
+        static let lockTimeoutMinutes = "lock_timeout_minutes"
     }
 
     // Persisted settings (manual UserDefaults for iOS 13 compatibility)
@@ -150,6 +110,13 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Auto-lock DCA after N minutes of inactivity (0 = never).
+    @Published var lockTimeoutMinutes: Int {
+        didSet {
+            UserDefaults.standard.set(lockTimeoutMinutes, forKey: Keys.lockTimeoutMinutes)
+        }
+    }
+
     @Published var dcaEntries: [DcaEntry] = [] {
         didSet { saveDca() }
     }
@@ -165,7 +132,8 @@ final class AppModel: ObservableObject {
         self.currency = UserDefaults.standard.string(forKey: Keys.currency) ?? "USD"
         self.satsMode = UserDefaults.standard.bool(forKey: Keys.satsMode)
         let storedGoal = UserDefaults.standard.object(forKey: Keys.satsGoalSats) as? NSNumber
-        self.satsGoalSats = storedGoal?.int64Value ?? 1_000_000 // default: 1,000,000 sats
+        self.satsGoalSats = storedGoal?.int64Value ?? 50_000_000 // default: 50,000,000 sats
+        self.lockTimeoutMinutes = UserDefaults.standard.integer(forKey: Keys.lockTimeoutMinutes)
         self.dcaEntries = []
         self.dcaEntries = loadDca()
     }
@@ -175,7 +143,7 @@ final class AppModel: ObservableObject {
     }
 
     func btcToSats(_ btc: Double) -> Int64 {
-        Int64((btc * 100_000_000).rounded())
+        Int64((btc * 100_000_000_000).rounded())
     }
 
     func formatSats(_ sats: Int64) -> String {
@@ -451,6 +419,10 @@ struct ContentView: View {
                     .environmentObject(model)
                     .tabItem { Label("DCA", systemImage: "chart.line.uptrend.xyaxis") }
 
+                NavigationView { LearnView() }
+                    .environmentObject(model)
+                    .tabItem { Label("Learn", systemImage: "book.fill") }
+
                 NavigationView { SettingsView() }
                     .environmentObject(model)
                     .tabItem { Label("Settings", systemImage: "gearshape") }
@@ -459,13 +431,7 @@ struct ContentView: View {
 
             Rectangle()
                 .frame(height: 60)
-                .background {
-                    if #available(iOS 17, *) {
-                        Color.clear.background(.ultraThinMaterial)
-                    } else {
-                        Color.clear.background(.ultraThinMaterial)
-                    }
-                }
+                .background { Color.clear.background(.ultraThinMaterial) }
                 .ignoresSafeArea(edges: .bottom)
                 .allowsHitTesting(false)
                 .zIndex(-1)
@@ -535,12 +501,6 @@ struct HomeView: View {
                     .padding(12)
                     .background(.ultraThinMaterial)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
-
-                    NavigationLink("Learn About Bitcoin") {
-                        LearnView()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Color.btcOrange)
 
                     VStack(alignment: .leading, spacing: 6) {
                         Text("What you can do in this app:")
@@ -718,7 +678,7 @@ struct PriceView: View {
             .onAppear {
                 Task { await refreshAll(forceComparisons: false) }
             }
-            .onChange(of: model.isProMode) { newValue in
+            .onChange(of: model.isProMode) { _, newValue in
                 if newValue {
                     Task { await refreshComparisons(force: false) }
                 } else {
@@ -726,7 +686,7 @@ struct PriceView: View {
                     paxg = nil
                 }
             }
-            .onChange(of: model.currency) { _ in
+            .onChange(of: model.currency) { _, _ in
                 Task { await refreshAll(forceComparisons: false) }
             }
         }
@@ -761,7 +721,7 @@ struct PriceView: View {
             let now = Date()
             lastUpdatedAt = now
             let df = DateFormatter()
-            df.dateFormat = "HH:mm:ss"
+            df.timeStyle = .medium
             lastUpdated = df.string(from: now)
 
             if model.isProMode {
@@ -816,6 +776,8 @@ struct DcaView: View {
     @State private var showImporter = false
     @State private var importError: String?
     @State private var pendingImportCount: Int?
+    @State private var pendingImport: [DcaEntry]?
+    @State private var showImportConfirm = false
 
     private enum Field: Hashable { case amount, price }
     @FocusState private var focusedField: Field?
@@ -827,6 +789,7 @@ struct DcaView: View {
     @State private var lastPriceUpdated: String?
     @State private var lastPriceFetchAt: Date?
     @State private var autoRefreshTask: Task<Void, Never>?
+    @State private var lastActivityDate = Date()
 
     private static let dateFormatter: DateFormatter = {
         let df = DateFormatter()
@@ -879,164 +842,206 @@ struct DcaView: View {
         }
     }
 
-    var body: some View {
+    // MARK: - Extracted Sections
+
+    @ViewBuilder
+    private var inputSection: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Live BTC (\(model.currency))")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if isLoadingPrice {
+                        ProgressView().scaleEffect(0.9)
+                    } else if let p = currentBtcPrice {
+                        Text(p, format: .currency(code: model.currency))
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("—")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let lastPriceUpdated {
+                    Text("Last price update: \(lastPriceUpdated)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                TextField("Amount (BTC)", text: $amountInput)
+                    .keyboardType(.decimalPad)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .focused($focusedField, equals: .amount)
+
+                HStack {
+                    let priceLabel = "Price paid (\(model.currency))"
+                    TextField(priceLabel, text: $priceInput)
+                        .keyboardType(.decimalPad)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
+                        .focused($focusedField, equals: .price)
+
+                    Button {
+                        if let p = currentBtcPrice {
+                            priceInput = String(format: "%.2f", p)
+                            inputError = nil
+                        }
+                    } label: {
+                        Image(systemName: "arrow.down.to.line.compact")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Use current BTC price")
+                    .disabled(currentBtcPrice == nil)
+                }
+
+                if let inputError {
+                    Text(inputError).foregroundStyle(.red)
+                }
+
+                Button("Add Buy") { addEntry() }
+                    .frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var totalsSection: some View {
         let totalBtc = model.dcaEntries.reduce(0) { $0 + $1.amountBtc }
         let totalCost = model.dcaEntries.reduce(0) { $0 + $1.costUsd }
         let avg = totalBtc > 0 ? totalCost / totalBtc : 0
         let livePrice = currentBtcPrice
         let currentValue = (livePrice ?? 0) * totalBtc
-        let pnlUsd = (livePrice != nil) ? (currentValue - totalCost) : nil
-        let pnlPct = (livePrice != nil && totalCost > 0) ? ((currentValue - totalCost) / totalCost) * 100 : nil
 
-        return WatermarkBackground {
+        Section("Totals") {
+            if model.satsMode {
+                let sats = model.btcToSats(totalBtc)
+                Text("Total: \(model.formatSats(sats)) sats")
+            } else {
+                Text("Total BTC: \(model.formatBtc(totalBtc))")
+            }
+            Text("Total Cost: \(totalCost, format: .currency(code: model.currency))")
+            Text("Average Cost: \(avg, format: .currency(code: model.currency))")
+
+            if currentBtcPrice != nil {
+                Text("Current Value: \(currentValue, format: .currency(code: model.currency))")
+                let pnlUsd = currentValue - totalCost
+                let pnlPct = totalCost > 0 ? ((currentValue - totalCost) / totalCost) * 100 : 0.0
+                let isUp = pnlUsd >= 0
+                let arrow = isUp ? "↑" : "↓"
+                Text("P/L: \(arrow) \(isUp ? "+" : "")\(pnlUsd, specifier: "%.2f") \(model.currency) (\(isUp ? "+" : "")\(pnlPct, specifier: "%.2f")%)")
+                    .foregroundStyle(isUp ? Color.btcOrange : Color.red)
+            } else {
+                Text("Current Value: —")
+                    .foregroundStyle(.secondary)
+                Text("P/L: —")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var allocationSection: some View {
+        Section("Allocation") {
+            let bucketSize: Double = 10_000
+            let grouped = Dictionary(grouping: model.dcaEntries) { e -> Int in
+                Int(floor(e.priceUsd / bucketSize))
+            }
+            let keys = grouped.keys.sorted()
+
+            if keys.isEmpty {
+                Text("No allocation data yet.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(keys, id: \.self) { k in
+                    let lower = Double(k) * bucketSize
+                    let upper = lower + bucketSize
+                    let entries = grouped[k] ?? []
+                    let btc = entries.reduce(0.0) { $0 + $1.amountBtc }
+                    let buys = entries.count
+                    HStack {
+                        Text("\(lower, format: .currency(code: model.currency))–\(upper, format: .currency(code: model.currency))")
+                            .font(.footnote)
+                        Spacer()
+                        Text("\(btc, specifier: "%.8f") BTC")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        Text("(\(buys))")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var monthlyChartSection: some View {
+        Section("Monthly Buys") {
+            MonthlyChart(
+                entries: model.dcaEntries,
+                satsMode: model.satsMode,
+                formatSats: model.formatSats
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var recentBuysSection: some View {
+        Section("Recent Buys") {
+            if model.dcaEntries.isEmpty {
+                Text("No buys yet. Add your first entry above.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(model.dcaEntries.sorted(by: { $0.timestamp > $1.timestamp })) { e in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            if model.satsMode {
+                                let sats = model.btcToSats(e.amountBtc)
+                                Text("\(model.formatSats(sats)) sats @ \(e.priceUsd, format: .currency(code: model.currency))")
+                                    .font(.subheadline)
+                            } else {
+                                Text("\(e.amountBtc, specifier: "%.8f") BTC @ \(e.priceUsd, format: .currency(code: model.currency))")
+                                    .font(.subheadline)
+                            }
+                            Spacer()
+                            if let live = currentBtcPrice, e.priceUsd > 0 {
+                                let pctChange = ((live - e.priceUsd) / e.priceUsd) * 100
+                                let arrow = pctChange >= 0 ? "↑" : "↓"
+                                Text("\(arrow) \(pctChange, specifier: "%.1f")%")
+                                    .font(.caption2).bold()
+                                    .foregroundStyle(pctChange >= 0 ? Color.green : Color.red)
+                            }
+                        }
+                        Text("Cost: \(e.costUsd, format: .currency(code: model.currency)) • \(Self.dateFormatter.string(from: e.date))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture { startEditing(e) }
+                }
+                .onDelete(perform: deleteEntries)
+            }
+        }
+    }
+
+    // MARK: - Body
+
+    var body: some View {
+        WatermarkBackground {
             if !isUnlocked {
                 lockedView
             } else {
                 List {
-                    Section {
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack {
-                                Text("Live BTC (USD)")
-                                    .font(.footnote)
-                                    .foregroundStyle(.secondary)
-                                Spacer()
-                                if isLoadingPrice {
-                                    ProgressView().scaleEffect(0.9)
-                                } else if let p = currentBtcPrice {
-                                    Text(p, format: .currency(code: "USD"))
-                                        .font(.footnote)
-                                        .foregroundStyle(.secondary)
-                                } else {
-                                    Text("—")
-                                        .font(.footnote)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-
-                            if let lastPriceUpdated {
-                                Text("Last price update: \(lastPriceUpdated)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            TextField("Amount (BTC)", text: $amountInput)
-                                .keyboardType(.decimalPad)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled(true)
-                                .focused($focusedField, equals: .amount)
-
-                            HStack {
-                                TextField("Price paid (USD)", text: $priceInput)
-                                    .keyboardType(.decimalPad)
-                                    .textInputAutocapitalization(.never)
-                                    .autocorrectionDisabled(true)
-                                    .focused($focusedField, equals: .price)
-
-                                Button {
-                                    if let p = currentBtcPrice {
-                                        priceInput = String(format: "%.2f", p)
-                                        inputError = nil
-                                    }
-                                } label: {
-                                    Image(systemName: "arrow.down.to.line.compact")
-                                }
-                                .buttonStyle(.bordered)
-                                .help("Use current BTC price")
-                                .disabled(currentBtcPrice == nil)
-                            }
-
-                            if let inputError {
-                                Text(inputError).foregroundStyle(.red)
-                            }
-
-                            Button("Add Buy") { addEntry() }
-                                .frame(maxWidth: .infinity)
-                        }
-                    }
-
-                    Section("Totals") {
-                        if model.satsMode {
-                            let sats = model.btcToSats(totalBtc)
-                            Text("Total: \(model.formatSats(sats)) sats")
-                        } else {
-                            Text("Total BTC: \(model.formatBtc(totalBtc))")
-                        }
-                        Text("Total Cost: \(totalCost, format: .currency(code: "USD"))")
-                        Text("Average Cost: \(avg, format: .currency(code: "USD"))")
-
-                        if let p = currentBtcPrice {
-                            Text("Current Value: \(currentValue, format: .currency(code: "USD"))")
-                            if let pnlUsd, let pnlPct {
-                                let isUp = pnlUsd >= 0
-                                Text("P/L: \(isUp ? "+" : "")\(pnlUsd, specifier: "%.2f") USD (\(isUp ? "+" : "")\(pnlPct, specifier: "%.2f")%)")
-                                    .foregroundStyle(isUp ? Color.btcOrange : Color.red)
-                            }
-                        } else {
-                            Text("Current Value: —")
-                                .foregroundStyle(.secondary)
-                            Text("P/L: —")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-
-                    Section("Allocation") {
-                        // Bucket buys by price ranges for quick insight.
-                        let bucketSize: Double = 10_000
-                        let grouped = Dictionary(grouping: model.dcaEntries) { e -> Int in
-                            Int(floor(e.priceUsd / bucketSize))
-                        }
-                        let keys = grouped.keys.sorted()
-
-                        if keys.isEmpty {
-                            Text("No allocation data yet.")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(keys, id: \.self) { k in
-                                let lower = Double(k) * bucketSize
-                                let upper = lower + bucketSize
-                                let entries = grouped[k] ?? []
-                                let btc = entries.reduce(0.0) { $0 + $1.amountBtc }
-                                let buys = entries.count
-                                HStack {
-                                    Text("\(lower, format: .currency(code: "USD"))–\(upper, format: .currency(code: "USD"))")
-                                        .font(.footnote)
-                                    Spacer()
-                                    Text("\(btc, specifier: "%.8f") BTC")
-                                        .font(.footnote)
-                                        .foregroundStyle(.secondary)
-                                    Text("(\(buys))")
-                                        .font(.footnote)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    }
-
-                    Section("Recent Buys") {
-                        if model.dcaEntries.isEmpty {
-                            Text("No buys yet. Add your first entry above.")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(model.dcaEntries.sorted(by: { $0.timestamp > $1.timestamp })) { e in
-                                VStack(alignment: .leading, spacing: 4) {
-                                    if model.satsMode {
-                                        let sats = model.btcToSats(e.amountBtc)
-                                        Text("\(model.formatSats(sats)) sats @ \(e.priceUsd, format: .currency(code: "USD"))")
-                                            .font(.subheadline)
-                                    } else {
-                                        Text("\(e.amountBtc, specifier: "%.8f") BTC @ \(e.priceUsd, format: .currency(code: "USD"))")
-                                            .font(.subheadline)
-                                    }
-                                    Text("Cost: \(e.costUsd, format: .currency(code: "USD")) • \(Self.dateFormatter.string(from: e.date))")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                .contentShape(Rectangle())
-                                .onTapGesture { startEditing(e) }
-                            }
-                            .onDelete(perform: deleteEntries)
-                        }
-                    }
+                    inputSection
+                    totalsSection
+                    allocationSection
+                    monthlyChartSection
+                    recentBuysSection
                 }
             }
         }
@@ -1045,6 +1050,13 @@ struct DcaView: View {
             await refreshLivePriceIfNeeded(force: false)
         }
         .onAppear {
+            // Re-lock if timeout has elapsed
+            if model.lockTimeoutMinutes > 0,
+               Date().timeIntervalSince(lastActivityDate) > Double(model.lockTimeoutMinutes) * 60 {
+                isUnlocked = false
+            }
+            lastActivityDate = Date()
+
             // Auto-refresh every 60s while visible, but skip if we fetched recently.
             autoRefreshTask?.cancel()
             autoRefreshTask = Task {
@@ -1119,6 +1131,22 @@ struct DcaView: View {
                 importError = "Import failed: \(error.localizedDescription)"
             }
         }
+        .alert("Replace DCA entries?", isPresented: $showImportConfirm) {
+            Button("Replace", role: .destructive) {
+                if let entries = pendingImport {
+                    model.dcaEntries = entries
+                    pendingImportCount = entries.count
+                    pendingImport = nil
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingImport = nil
+            }
+        } message: {
+            let existing = model.dcaEntries.count
+            let incoming = pendingImport?.count ?? 0
+            Text("This will replace your \(existing) existing entries with \(incoming) imported entries. This cannot be undone.")
+        }
         .sheet(item: $editingEntry) { entry in
             NavigationView {
                 Form {
@@ -1128,12 +1156,13 @@ struct DcaView: View {
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled(true)
 
-                        TextField("Price (USD)", text: $editPriceInput)
+                        let editPriceLabel = "Price (\(model.currency))"
+                        TextField(editPriceLabel, text: $editPriceInput)
                             .keyboardType(.decimalPad)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled(true)
 
-                        DatePicker("Date", selection: $editDate, displayedComponents: [.date, .hourAndMinute])
+                        DatePicker("Date", selection: $editDate, in: ...Date(), displayedComponents: [.date, .hourAndMinute])
 
                         if let editError {
                             Text(editError)
@@ -1180,7 +1209,7 @@ struct DcaView: View {
             return DcaExportDocument(data: Data(csv.utf8))
         }
     }
-    private func makeCSV(entries: [DcaEntry]) -> String {
+    func makeCSV(entries: [DcaEntry]) -> String {
         var lines: [String] = []
         lines.append("id,amount_btc,price_usd,timestamp")
         for e in entries {
@@ -1194,7 +1223,7 @@ struct DcaView: View {
         return lines.joined(separator: "\n")
     }
 
-    private func parseCSV(_ text: String) -> [DcaEntry] {
+    func parseCSV(_ text: String) -> [DcaEntry] {
         let rows = text
             .split(whereSeparator: \.isNewline)
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -1246,8 +1275,8 @@ struct DcaView: View {
     private func handleImportedData(_ data: Data, suggestedName: String?) {
         // Try JSON first, then CSV.
         if let decoded = try? JSONDecoder().decode([DcaEntry].self, from: data), !decoded.isEmpty {
-            model.dcaEntries = decoded
-            pendingImportCount = decoded.count
+            pendingImport = decoded
+            showImportConfirm = true
             importError = nil
             return
         }
@@ -1255,8 +1284,8 @@ struct DcaView: View {
         if let text = String(data: data, encoding: .utf8) {
             let parsed = parseCSV(text)
             if !parsed.isEmpty {
-                model.dcaEntries = parsed
-                pendingImportCount = parsed.count
+                pendingImport = parsed
+                showImportConfirm = true
                 importError = nil
                 return
             }
@@ -1270,6 +1299,7 @@ struct DcaView: View {
         let sorted = model.dcaEntries.sorted(by: { $0.timestamp > $1.timestamp })
         let idsToDelete = offsets.compactMap { sorted[$0].id }
         model.dcaEntries.removeAll { idsToDelete.contains($0.id) }
+        UINotificationFeedbackGenerator().notificationOccurred(.warning)
     }
 
     private func refreshLivePriceIfNeeded(force: Bool) async {
@@ -1283,18 +1313,15 @@ struct DcaView: View {
         defer { isLoadingPrice = false }
 
         do {
-            let p = try await CoinGeckoClient.fetchBtcSpot(vsCurrency: "USD")
+            let p = try await CoinGeckoClient.fetchBtcSpot(vsCurrency: model.currency)
             currentBtcPrice = p
             lastPriceFetchAt = Date()
 
             let df = DateFormatter()
-            df.dateFormat = "HH:mm:ss"
+            df.timeStyle = .medium
             lastPriceUpdated = df.string(from: Date())
         } catch {
             // Keep the DCA screen functional even if price fetch fails.
-            if currentBtcPrice == nil {
-                currentBtcPrice = nil
-            }
         }
     }
 
@@ -1304,6 +1331,8 @@ struct DcaView: View {
             return
         }
         model.dcaEntries.append(DcaEntry(amountBtc: a, priceUsd: p))
+        lastActivityDate = Date()
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         amountInput = ""
         priceInput = ""
         inputError = nil
@@ -1321,6 +1350,14 @@ struct LearnView: View {
                         .foregroundStyle(Color.btcOrange)
 
                     Text("• Bitcoin is a decentralized digital currency with a fixed supply of 21 million coins.\n• It runs on a peer-to-peer network secured by miners using Proof-of-Work.\n• Transactions are recorded on a public ledger called the blockchain.\n• Bitcoin is divisible into 100,000,000 units called satoshis.\n• Price can be very volatile—never invest more than you can afford to lose.")
+                        .font(.body)
+
+                    Text("What is Dollar-Cost Averaging?")
+                        .font(.title3).bold()
+                        .foregroundStyle(Color.btcOrange)
+                        .padding(.top, 12)
+
+                    Text("• DCA means investing a fixed amount at regular intervals, regardless of price.\n• Instead of trying to time the market, you buy consistently over time.\n• Your average cost per BTC smooths out volatility — you buy more when prices are low, less when high.\n• This app tracks your average cost so you can see how your DCA strategy is performing.")
                         .font(.body)
 
                     Text("Primary sources:")
@@ -1421,16 +1458,15 @@ struct SettingsView: View {
                     }
                     .padding(.top, 6)
 
-                    Text("Display Currency (Price tab): \(model.currency)")
-                        .foregroundStyle(.secondary)
-
-                    Button {
-                        model.toggleCurrency()
-                    } label: {
-                        Text("Toggle Currency (USD / EUR)")
-                            .frame(maxWidth: .infinity)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Display Currency")
+                            .font(.subheadline).bold()
+                        Picker("Currency", selection: $model.currency) {
+                            Text("USD").tag("USD")
+                            Text("EUR").tag("EUR")
+                        }
+                        .pickerStyle(.segmented)
                     }
-                    .buttonStyle(.bordered)
 
                     Divider().padding(.vertical, 6)
 
@@ -1448,20 +1484,20 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
 
                         HStack {
-                            Button("-100k") {
-                                model.satsGoalSats = max(100_000, model.satsGoalSats - 100_000)
+                            Button("-10M") {
+                                model.satsGoalSats = max(10_000_000, model.satsGoalSats - 10_000_000)
                             }
                             .buttonStyle(.bordered)
 
-                            Button("+100k") {
-                                model.satsGoalSats = min(2_100_000_000_000_000, model.satsGoalSats + 100_000)
+                            Button("+10M") {
+                                model.satsGoalSats = min(2_100_000_000_000_000, model.satsGoalSats + 10_000_000)
                             }
                             .buttonStyle(.bordered)
 
                             Spacer()
 
-                            Button("Set 1M") {
-                                model.satsGoalSats = 1_000_000
+                            Button("Set 50M") {
+                                model.satsGoalSats = 50_000_000
                             }
                             .buttonStyle(.bordered)
                         }
@@ -1469,23 +1505,100 @@ struct SettingsView: View {
 
                     Divider().padding(.vertical, 6)
 
-                    Text("Pro Mode (BTC vs Gold & ETH): \(model.isProMode ? "On" : "Off")")
-                        .foregroundStyle(.secondary)
-
-                    Button {
-                        model.isProMode.toggle()
-                    } label: {
-                        Text("Toggle Pro Mode")
-                            .frame(maxWidth: .infinity)
+                    Toggle(isOn: $model.isProMode) {
+                        Text("Pro Mode (BTC vs Gold & ETH)")
+                            .font(.subheadline).bold()
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Color.btcOrange)
+
+                    Divider().padding(.vertical, 6)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Auto-Lock DCA")
+                            .font(.subheadline).bold()
+
+                        Text("Re-require Face ID / Touch ID after inactivity.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        Picker("Auto-Lock", selection: $model.lockTimeoutMinutes) {
+                            Text("Never").tag(0)
+                            Text("1 min").tag(1)
+                            Text("5 min").tag(5)
+                            Text("15 min").tag(15)
+                        }
+                        .pickerStyle(.segmented)
+                    }
 
                     Spacer(minLength: 20)
                 }
                 .padding(20)
             }
             .navigationTitle("Settings")
+        }
+    }
+}
+
+// MARK: - Monthly Bar Chart
+
+struct MonthlyChart: View {
+    let entries: [DcaEntry]
+    let satsMode: Bool
+    let formatSats: (Int64) -> String
+
+    private var monthlyData: [(label: String, btc: Double)] {
+        guard !entries.isEmpty else { return [] }
+        let cal = Calendar.current
+        let df = DateFormatter()
+        df.dateFormat = "MMM ''yy"
+
+        let grouped = Dictionary(grouping: entries) { e -> DateComponents in
+            cal.dateComponents([.year, .month], from: e.date)
+        }
+
+        return grouped.keys
+            .sorted { ($0.year ?? 0, $0.month ?? 0) < ($1.year ?? 0, $1.month ?? 0) }
+            .compactMap { key -> (String, Double)? in
+                guard let date = cal.date(from: key) else { return nil }
+                let btc = (grouped[key] ?? []).reduce(0.0) { $0 + $1.amountBtc }
+                return (df.string(from: date), btc)
+            }
+    }
+
+    var body: some View {
+        let data = monthlyData
+        if data.isEmpty {
+            Text("No monthly data yet.")
+                .foregroundStyle(.secondary)
+        } else {
+            let maxBtc = data.map(\.btc).max() ?? 1
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(data, id: \.label) { item in
+                    HStack(spacing: 8) {
+                        Text(item.label)
+                            .font(.caption)
+                            .frame(width: 60, alignment: .leading)
+
+                        GeometryReader { geo in
+                            let barWidth = max(CGFloat(item.btc / maxBtc) * geo.size.width, 4)
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(Color.btcOrange)
+                                .frame(width: barWidth, height: 16)
+                        }
+                        .frame(height: 16)
+
+                        if satsMode {
+                            let sats = Int64((item.btc * 100_000_000).rounded())
+                            Text("\(formatSats(sats)) sats")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("\(item.btc, specifier: "%.8f")")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
         }
     }
 }
