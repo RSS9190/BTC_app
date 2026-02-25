@@ -143,7 +143,7 @@ final class AppModel: ObservableObject {
     }
 
     func btcToSats(_ btc: Double) -> Int64 {
-        Int64((btc * 100_000_000_000).rounded())
+        Int64((btc * 100_000_000).rounded())
     }
 
     func formatSats(_ sats: Int64) -> String {
