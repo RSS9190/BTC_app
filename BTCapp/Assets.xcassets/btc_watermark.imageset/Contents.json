@@ -1,0 +1,13 @@
+{
+  "images" : [
+    {
+      "filename" : "btc_watermark.png",
+      "idiom" : "universal",
+      "scale" : "1x"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}
