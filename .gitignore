@@ -63,3 +63,6 @@ fastlane/test_output
 .aider*
 .claude/
 .DS_Store
+
+# Secrets — real API keys (copy Secrets.swift.example to set up)
+BTCapp/Secrets.swift
